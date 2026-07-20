@@ -1,0 +1,10 @@
+[package]
+name = "descriptor_metadata_research"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bdk_wallet = { path = "../../..", features = ["std", "elias-fano", "test-utils"] }
+csv = "1"
+serde = { version = "1", features = ["derive"] }
