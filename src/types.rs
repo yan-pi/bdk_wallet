@@ -152,9 +152,46 @@ impl Utxo {
 pub struct SpkMetadata {
     /// The keychain this metadata belongs to.
     keychain: KeychainKind,
+    /// Highest derivation index revealed by the wallet.
+    last_revealed: Option<u32>,
     /// Sorted derivation indexes that have been used (have on-chain `TxOut`s).
     used_indexes: Vec<u32>,
 }
+
+/// Error returned when descriptor metadata contains inconsistent indexes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpkMetadataError {
+    /// A used index exists outside the revealed descriptor range.
+    UsedIndexBeyondLastRevealed {
+        /// Highest index marked as used.
+        highest_used: u32,
+        /// Highest revealed index, or `None` when nothing was revealed.
+        last_revealed: Option<u32>,
+    },
+}
+
+impl fmt::Display for SpkMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UsedIndexBeyondLastRevealed {
+                highest_used,
+                last_revealed: Some(last_revealed),
+            } => write!(
+                f,
+                "highest used index {highest_used} exceeds last revealed index {last_revealed}"
+            ),
+            Self::UsedIndexBeyondLastRevealed {
+                highest_used,
+                last_revealed: None,
+            } => write!(
+                f,
+                "used index {highest_used} exists without a revealed descriptor range"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for SpkMetadataError {}
 
 impl SpkMetadata {
     /// Build script pubkey metadata for a keychain.
@@ -162,14 +199,45 @@ impl SpkMetadata {
     /// The provided indexes are zero-based BDK derivation indexes. They are
     /// normalized by sorting and removing duplicates.
     pub fn new(keychain: KeychainKind, used_indexes: impl Into<Vec<u32>>) -> Self {
-        let mut used_indexes = used_indexes.into();
-        used_indexes.sort_unstable();
-        used_indexes.dedup();
+        let used_indexes = Self::normalize_used_indexes(used_indexes);
+        let last_revealed = used_indexes.last().copied();
 
         Self {
             keychain,
+            last_revealed,
             used_indexes,
         }
+    }
+
+    /// Build metadata with an explicit highest revealed derivation index.
+    ///
+    /// Returns an error when a used index is greater than `last_revealed`, or
+    /// when used indexes are provided without a revealed descriptor range.
+    pub fn with_last_revealed(
+        keychain: KeychainKind,
+        last_revealed: Option<u32>,
+        used_indexes: impl Into<Vec<u32>>,
+    ) -> Result<Self, SpkMetadataError> {
+        let used_indexes = Self::normalize_used_indexes(used_indexes);
+
+        if let Some(highest_used) = used_indexes.last().copied() {
+            let used_is_revealed = last_revealed
+                .map(|last_revealed| highest_used <= last_revealed)
+                .unwrap_or(false);
+
+            if !used_is_revealed {
+                return Err(SpkMetadataError::UsedIndexBeyondLastRevealed {
+                    highest_used,
+                    last_revealed,
+                });
+            }
+        }
+
+        Ok(Self {
+            keychain,
+            last_revealed,
+            used_indexes,
+        })
     }
 
     /// Return the keychain this metadata belongs to.
@@ -177,14 +245,24 @@ impl SpkMetadata {
         self.keychain
     }
 
+    /// Return the highest revealed derivation index.
+    pub fn last_revealed(&self) -> Option<u32> {
+        self.last_revealed
+    }
+
     /// Return the sorted zero-based derivation indexes with known wallet activity.
     pub fn used_indexes(&self) -> &[u32] {
         &self.used_indexes
     }
 
-    /// Return whether this metadata contains no used indexes.
+    /// Return whether this metadata contains no revealed or used indexes.
     pub fn is_empty(&self) -> bool {
-        self.used_indexes.is_empty()
+        self.last_revealed.is_none() && self.used_indexes.is_empty()
+    }
+
+    /// Consume this metadata and return its individual parts.
+    pub fn into_parts(self) -> (KeychainKind, Option<u32>, Vec<u32>) {
+        (self.keychain, self.last_revealed, self.used_indexes)
     }
 
     /// Consume this metadata and return the used indexes.
@@ -192,26 +270,51 @@ impl SpkMetadata {
         self.used_indexes
     }
 
+    fn normalize_used_indexes(used_indexes: impl Into<Vec<u32>>) -> Vec<u32> {
+        let mut used_indexes = used_indexes.into();
+        used_indexes.sort_unstable();
+        used_indexes.dedup();
+        used_indexes
+    }
+
     /// Build [`SpkMetadata`] from a [`KeychainTxOutIndex`] for the given keychain.
     ///
-    /// The collected indexes are normalized through [`SpkMetadata::new`].
+    /// The metadata captures both the highest revealed derivation index and the
+    /// normalized indexes with known wallet outputs.
     ///
     /// [`KeychainTxOutIndex`]: chain::indexer::keychain_txout::KeychainTxOutIndex
     pub fn from_index(
         index: &chain::indexer::keychain_txout::KeychainTxOutIndex<KeychainKind>,
         keychain: KeychainKind,
     ) -> Self {
-        let used_indexes: Vec<u32> = index
-            .keychain_outpoints(keychain)
-            .map(|(idx, _)| idx)
-            .collect();
+        let used_indexes = Self::normalize_used_indexes(
+            index
+                .keychain_outpoints(keychain)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+        );
 
-        Self::new(keychain, used_indexes)
+        let last_revealed = index
+            .last_revealed_index(keychain)
+            .max(used_indexes.last().copied());
+
+        Self {
+            keychain,
+            last_revealed,
+            used_indexes,
+        }
     }
 }
 
 #[cfg(feature = "elias-fano")]
 const SPK_METADATA_BECH32_HRP: &str = "spkmeta";
+
+#[cfg(feature = "elias-fano")]
+#[derive(Serialize, Deserialize)]
+struct SpkMetadataPayload {
+    last_revealed: Option<u32>,
+    used_indexes: Option<sux::prelude::EliasFano>,
+}
 
 #[cfg(feature = "elias-fano")]
 impl SpkMetadata {
@@ -233,22 +336,23 @@ impl SpkMetadata {
             .expect("metadata is not empty") as usize
             + 1;
 
-        let mut efb = EliasFanoBuilder::new(n, upper_bound);
+        let mut builder = EliasFanoBuilder::new(n, upper_bound);
 
-        for &idx in &self.used_indexes {
-            efb.push(idx as usize);
+        for &index in &self.used_indexes {
+            builder.push(index as usize);
         }
-        Some(efb.build())
+
+        Some(builder.build())
     }
 
-    /// Encode `used_indexes` as an Elias-Fano representation serialized to a
-    /// base64 string.
+    /// Encode this metadata as a base64 transport string.
     ///
-    /// Returns `Ok(None)` if there are no used indexes.
+    /// Returns `Ok(None)` only when the metadata contains neither revealed nor
+    /// used indexes.
     pub fn encode_base64(&self) -> Result<Option<String>, SpkMetadataEncodingError> {
         use bitcoin::base64::prelude::{Engine as _, BASE64_STANDARD};
 
-        let payload = match self.encode_elias_fano_payload()? {
+        let payload = match self.encode_payload()? {
             Some(payload) => payload,
             None => return Ok(None),
         };
@@ -256,31 +360,32 @@ impl SpkMetadata {
         Ok(Some(BASE64_STANDARD.encode(payload)))
     }
 
-    /// Decode a base64-encoded Elias-Fano representation back into [`SpkMetadata`].
+    /// Decode base64 metadata for the given keychain.
     ///
-    /// Returns an error if the input is not valid base64 or does not contain a valid
-    /// Elias-Fano payload.
+    /// Returns an error if the input is not valid base64 or does not contain a
+    /// supported metadata payload.
     pub fn decode_base64(
-        b64: &str,
+        encoded: &str,
         keychain: KeychainKind,
     ) -> Result<Self, SpkMetadataEncodingError> {
         use bitcoin::base64::prelude::{Engine as _, BASE64_STANDARD};
 
         let payload = BASE64_STANDARD
-            .decode(b64)
+            .decode(encoded)
             .map_err(SpkMetadataEncodingError::Base64)?;
 
-        Self::decode_elias_fano_payload(&payload, keychain)
+        Self::decode_payload(&payload, keychain)
     }
 
-    /// Encode `used_indexes` as bech32-encoded Elias-Fano metadata.
+    /// Encode this metadata as a bech32 transport string.
     ///
     /// The encoded string uses the `spkmeta` human-readable part. Returns
-    /// `Ok(None)` if there are no used indexes.
+    /// `Ok(None)` only when the metadata contains neither revealed nor used
+    /// indexes.
     pub fn encode_bech32(&self) -> Result<Option<String>, SpkMetadataEncodingError> {
         use bitcoin::bech32::{self, Bech32, Hrp};
 
-        let payload = match self.encode_elias_fano_payload()? {
+        let payload = match self.encode_payload()? {
             Some(payload) => payload,
             None => return Ok(None),
         };
@@ -292,10 +397,11 @@ impl SpkMetadata {
             .map_err(SpkMetadataEncodingError::Bech32Encode)
     }
 
-    /// Decode bech32-encoded Elias-Fano metadata.
+    /// Decode bech32 metadata for the given keychain.
     ///
-    /// Returns an error if the input is not valid bech32, if the human-readable
-    /// part is not `spkmeta`, or if the payload is not valid Elias-Fano metadata.
+    /// Returns an error if the input is not valid bech32, if the
+    /// human-readable part is not `spkmeta`, or if the payload version is not
+    /// supported.
     pub fn decode_bech32(
         encoded: &str,
         keychain: KeychainKind,
@@ -310,32 +416,48 @@ impl SpkMetadata {
             });
         }
 
-        Self::decode_elias_fano_payload(&payload, keychain)
+        Self::decode_payload(&payload, keychain)
     }
 
-    fn encode_elias_fano_payload(&self) -> Result<Option<Vec<u8>>, SpkMetadataEncodingError> {
-        let elias_fano = match self.encode_elias_fano() {
-            Some(elias_fano) => elias_fano,
-            None => return Ok(None),
+    fn encode_payload(&self) -> Result<Option<Vec<u8>>, SpkMetadataEncodingError> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let payload = SpkMetadataPayload {
+            last_revealed: self.last_revealed,
+            used_indexes: self.encode_elias_fano(),
         };
 
-        serde_json::to_vec(&elias_fano)
+        serde_json::to_vec(&payload)
             .map(Some)
             .map_err(SpkMetadataEncodingError::Json)
     }
 
-    fn decode_elias_fano_payload(
-        payload: &[u8],
+    fn decode_payload(
+        encoded: &[u8],
         keychain: KeychainKind,
     ) -> Result<Self, SpkMetadataEncodingError> {
-        let elias_fano: sux::prelude::EliasFano =
-            serde_json::from_slice(payload).map_err(SpkMetadataEncodingError::Json)?;
+        let payload: SpkMetadataPayload =
+            serde_json::from_slice(encoded).map_err(SpkMetadataEncodingError::Json)?;
+        let used_indexes = match payload.used_indexes {
+            Some(elias_fano) => Self::decode_used_indexes(elias_fano)?,
+            None => Vec::new(),
+        };
 
-        let used_indexes = elias_fano
+        Self::with_last_revealed(keychain, payload.last_revealed, used_indexes)
+            .map_err(SpkMetadataEncodingError::InvalidMetadata)
+    }
+
+    fn decode_used_indexes(
+        elias_fano: sux::prelude::EliasFano,
+    ) -> Result<Vec<u32>, SpkMetadataEncodingError> {
+        elias_fano
             .into_iter()
-            .map(|idx| u32::try_from(idx).map_err(|_| SpkMetadataEncodingError::IndexOverflow(idx)))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::new(keychain, used_indexes))
+            .map(|index| {
+                u32::try_from(index).map_err(|_| SpkMetadataEncodingError::IndexOverflow(index))
+            })
+            .collect()
     }
 }
 
@@ -345,8 +467,10 @@ impl SpkMetadata {
 pub enum SpkMetadataEncodingError {
     /// Failed to decode a base64 transport string.
     Base64(bitcoin::base64::DecodeError),
-    /// Failed to serialize or deserialize the Elias-Fano JSON payload.
+    /// Failed to serialize or deserialize the metadata JSON payload.
     Json(serde_json::Error),
+    /// The decoded metadata contains inconsistent indexes.
+    InvalidMetadata(SpkMetadataError),
     /// Failed to encode a bech32 transport string.
     Bech32Encode(bitcoin::bech32::EncodeError),
     /// Failed to decode a bech32 transport string.
@@ -367,7 +491,8 @@ impl fmt::Display for SpkMetadataEncodingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Base64(err) => write!(f, "base64 decoding error: {err}"),
-            Self::Json(err) => write!(f, "Elias-Fano JSON payload error: {err}"),
+            Self::Json(err) => write!(f, "metadata JSON payload error: {err}"),
+            Self::InvalidMetadata(err) => write!(f, "invalid metadata payload: {err}"),
             Self::Bech32Encode(err) => write!(f, "bech32 encoding error: {err}"),
             Self::Bech32Decode(err) => write!(f, "bech32 decoding error: {err}"),
             Self::InvalidBech32Hrp { expected, actual } => {
@@ -439,6 +564,7 @@ mod tests {
     fn test_spk_metadata_construction() {
         let meta = SpkMetadata::new(KeychainKind::External, vec![0, 1, 3]);
         assert_eq!(meta.keychain(), KeychainKind::External);
+        assert_eq!(meta.last_revealed(), Some(3));
         assert_eq!(meta.used_indexes(), &[0, 1, 3]);
     }
 
@@ -458,9 +584,11 @@ mod tests {
     #[test]
     #[cfg(feature = "elias-fano")]
     fn test_spk_metadata_base64_round_trip() {
-        let meta = SpkMetadata::new(KeychainKind::External, vec![0, 2, 5, 7]);
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), vec![0, 2, 5, 7])
+                .expect("metadata should be valid");
 
-        let encoded = meta
+        let encoded = metadata
             .encode_base64()
             .expect("metadata encoding should succeed")
             .expect("non-empty metadata should produce base64");
@@ -468,15 +596,17 @@ mod tests {
         let decoded = SpkMetadata::decode_base64(&encoded, KeychainKind::External)
             .expect("encoded metadata should decode");
 
-        assert_eq!(decoded, meta);
+        assert_eq!(decoded, metadata);
     }
 
     #[test]
     #[cfg(feature = "elias-fano")]
     fn test_spk_metadata_bech32_round_trip() {
-        let meta = SpkMetadata::new(KeychainKind::External, vec![0, 20, 50]);
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), vec![0, 20, 50])
+                .expect("metadata should be valid");
 
-        let encoded = meta
+        let encoded = metadata
             .encode_bech32()
             .expect("metadata encoding should succeed")
             .expect("non-empty metadata should produce bech32");
@@ -484,7 +614,43 @@ mod tests {
         let decoded = SpkMetadata::decode_bech32(&encoded, KeychainKind::External)
             .expect("encoded metadata should decode");
 
-        assert_eq!(decoded, meta);
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    #[cfg(feature = "elias-fano")]
+    fn test_spk_metadata_base64_round_trip_revealed_but_unused() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), Vec::new())
+                .expect("revealed metadata without used indexes should be valid");
+
+        let encoded = metadata
+            .encode_base64()
+            .expect("metadata encoding should succeed")
+            .expect("revealed metadata should produce base64");
+
+        let decoded = SpkMetadata::decode_base64(&encoded, KeychainKind::External)
+            .expect("encoded metadata should decode");
+
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    #[cfg(feature = "elias-fano")]
+    fn test_spk_metadata_bech32_round_trip_revealed_but_unused() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), Vec::new())
+                .expect("revealed metadata without used indexes should be valid");
+
+        let encoded = metadata
+            .encode_bech32()
+            .expect("metadata encoding should succeed")
+            .expect("revealed metadata should produce bech32");
+
+        let decoded = SpkMetadata::decode_bech32(&encoded, KeychainKind::External)
+            .expect("encoded metadata should decode");
+
+        assert_eq!(decoded, metadata);
     }
 
     #[test]
@@ -626,6 +792,7 @@ mod tests {
         let meta = SpkMetadata::new(KeychainKind::Internal, Vec::new());
 
         assert_eq!(meta.keychain(), KeychainKind::Internal);
+        assert_eq!(meta.last_revealed(), None);
         assert!(meta.is_empty());
     }
 
@@ -634,5 +801,62 @@ mod tests {
         let meta = SpkMetadata::new(KeychainKind::External, vec![3, 1, 1]);
 
         assert_eq!(meta.into_used_indexes(), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_spk_metadata_preserves_last_revealed() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), vec![1, 20, 50])
+                .expect("metadata should be valid");
+
+        assert_eq!(metadata.last_revealed(), Some(100));
+        assert_eq!(metadata.used_indexes(), &[1, 20, 50]);
+    }
+
+    #[test]
+    fn test_spk_metadata_supports_revealed_but_unused() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), Vec::new())
+                .expect("revealed metadata without used indexes should be valid");
+
+        assert_eq!(metadata.last_revealed(), Some(100));
+        assert!(metadata.used_indexes().is_empty());
+        assert!(!metadata.is_empty());
+    }
+
+    #[test]
+    fn test_spk_metadata_rejects_used_index_beyond_last_revealed() {
+        let error =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(20), vec![1, 20, 50])
+                .expect_err("index 50 is beyond last revealed index 20");
+
+        assert_eq!(
+            error,
+            SpkMetadataError::UsedIndexBeyondLastRevealed {
+                highest_used: 50,
+                last_revealed: Some(20),
+            }
+        );
+    }
+
+    #[test]
+    fn test_spk_metadata_rejects_used_index_without_revealed_state() {
+        let error = SpkMetadata::with_last_revealed(KeychainKind::External, None, vec![1])
+            .expect_err("used indexes require a revealed range");
+
+        assert_eq!(
+            error,
+            SpkMetadataError::UsedIndexBeyondLastRevealed {
+                highest_used: 1,
+                last_revealed: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_spk_metadata_new_infers_last_revealed_from_used_indexes() {
+        let metadata = SpkMetadata::new(KeychainKind::External, vec![1, 20, 50]);
+
+        assert_eq!(metadata.last_revealed(), Some(50));
     }
 }
