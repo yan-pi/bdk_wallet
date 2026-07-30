@@ -1959,22 +1959,25 @@ impl Wallet {
 
     /// Return the [`SpkMetadata`] for the given `keychain`.
     ///
-    /// This captures the sorted list of used derivation indexes.
+    /// This captures the highest revealed derivation index and the sorted indexes
+    /// with known wallet outputs.
     pub fn spk_metadata(&self, keychain: KeychainKind) -> SpkMetadata {
         SpkMetadata::from_index(&self.tx_graph.index, self.map_keychain(keychain))
     }
 
     /// Apply [`SpkMetadata`] to the wallet.
     ///
-    /// This reveals addresses up to the highest used index and marks each
-    /// used index, so that a subsequent
+    /// This restores the revealed descriptor range and marks each known used
+    /// index, so that a subsequent
     /// [`start_sync_with_revealed_spks`](Self::start_sync_with_revealed_spks)
-    /// covers the right range without needing a full scan.
+    /// covers the exported wallet state without requiring a full scan.
     pub fn apply_spk_metadata(&mut self, metadata: &SpkMetadata) {
         let keychain = self.map_keychain(metadata.keychain());
-        if let Some(&last) = metadata.used_indexes().last() {
-            let _ = self.reveal_addresses_to(keychain, last);
+
+        if let Some(last_revealed) = metadata.last_revealed() {
+            let _ = self.reveal_addresses_to(keychain, last_revealed);
         }
+
         for &index in metadata.used_indexes() {
             self.mark_used(keychain, index);
         }
@@ -3131,8 +3134,10 @@ mod test {
     fn test_spk_metadata_funded_wallet() {
         let (wallet, _txid) = get_funded_wallet_wpkh();
 
-        let meta = wallet.spk_metadata(KeychainKind::External);
-        assert!(!meta.used_indexes().is_empty());
+        let metadata = wallet.spk_metadata(KeychainKind::External);
+
+        assert!(metadata.last_revealed().is_some());
+        assert!(!metadata.used_indexes().is_empty());
     }
 
     #[test]
@@ -3141,9 +3146,96 @@ mod test {
         let wallet = Wallet::create(desc, change_desc)
             .network(Network::Regtest)
             .create_wallet_no_persist()
-            .unwrap();
+            .expect("research descriptors should be valid");
 
-        let meta = wallet.spk_metadata(KeychainKind::External);
-        assert!(meta.used_indexes().is_empty());
+        let metadata = wallet.spk_metadata(KeychainKind::External);
+
+        assert_eq!(metadata.last_revealed(), None);
+        assert!(metadata.used_indexes().is_empty());
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn test_spk_metadata_exports_last_revealed() {
+        let (mut wallet, _txid) = get_funded_wallet_wpkh();
+
+        let _ = wallet
+            .reveal_addresses_to(KeychainKind::External, 100)
+            .count();
+
+        let metadata = wallet.spk_metadata(KeychainKind::External);
+
+        assert_eq!(metadata.last_revealed(), Some(100));
+        assert!(!metadata.used_indexes().is_empty());
+    }
+
+    #[test]
+    fn test_spk_metadata_exports_revealed_but_unused_state() {
+        let (desc, change_desc) = get_test_wpkh_and_change_desc();
+        let mut wallet = Wallet::create(desc, change_desc)
+            .network(Network::Regtest)
+            .create_wallet_no_persist()
+            .expect("research descriptors should be valid");
+
+        let _ = wallet
+            .reveal_addresses_to(KeychainKind::External, 100)
+            .count();
+
+        let metadata = wallet.spk_metadata(KeychainKind::External);
+
+        assert_eq!(metadata.last_revealed(), Some(100));
+        assert!(metadata.used_indexes().is_empty());
+        assert!(!metadata.is_empty());
+    }
+
+    #[test]
+    fn test_apply_spk_metadata_restores_revealed_and_used_state() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), vec![1, 20, 50])
+                .expect("metadata should be valid");
+
+        let (desc, change_desc) = get_test_wpkh_and_change_desc();
+        let mut wallet = Wallet::create(desc, change_desc)
+            .network(Network::Regtest)
+            .create_wallet_no_persist()
+            .expect("research descriptors should be valid");
+
+        wallet.apply_spk_metadata(&metadata);
+
+        assert_eq!(wallet.derivation_index(KeychainKind::External), Some(100));
+        assert_eq!(wallet.next_derivation_index(KeychainKind::External), 101);
+
+        let unused_indexes = wallet
+            .list_unused_addresses(KeychainKind::External)
+            .map(|address| address.index)
+            .collect::<Vec<_>>();
+
+        assert!(unused_indexes.contains(&0));
+        assert!(!unused_indexes.contains(&1));
+        assert!(!unused_indexes.contains(&20));
+        assert!(!unused_indexes.contains(&50));
+        assert!(unused_indexes.contains(&100));
+    }
+
+    #[test]
+    fn test_apply_spk_metadata_restores_revealed_but_unused_state() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), Vec::new())
+                .expect("revealed metadata without used indexes should be valid");
+
+        let (desc, change_desc) = get_test_wpkh_and_change_desc();
+        let mut wallet = Wallet::create(desc, change_desc)
+            .network(Network::Regtest)
+            .create_wallet_no_persist()
+            .expect("research descriptors should be valid");
+
+        wallet.apply_spk_metadata(&metadata);
+
+        assert_eq!(wallet.derivation_index(KeychainKind::External), Some(100));
+        assert_eq!(wallet.next_derivation_index(KeychainKind::External), 101);
+        assert_eq!(
+            wallet.list_unused_addresses(KeychainKind::External).count(),
+            101
+        );
     }
 }
