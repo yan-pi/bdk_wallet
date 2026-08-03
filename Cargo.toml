@@ -81,3 +81,7 @@ name = "esplora_blocking"
 
 [[example]]
 name = "bitcoind_rpc"
+
+[patch.crates-io]
+bdk_chain = { path = "../bdk/crates/chain" }
+bdk_core = { path = "../bdk/crates/core" }
