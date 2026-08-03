@@ -158,6 +158,7 @@ where
             ),
         ]
         .into(),
+        ..Default::default()
     };
 
     let locked_outpoints_changeset = locked_outpoints::ChangeSet {
@@ -217,6 +218,7 @@ where
             SpkIterator::new_with_range(&descriptor, 37..=39).collect(),
         )]
         .into(),
+        ..Default::default()
     };
 
     let locked_outpoints_changeset = locked_outpoints::ChangeSet {

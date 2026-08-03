@@ -12,7 +12,8 @@ use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::error::CreateTxError;
 use bdk_wallet::test_utils::*;
 use bdk_wallet::{
-    ChangeSet, KeychainKind, LoadError, LoadMismatch, LoadWithPersistError, Wallet, WalletPersister,
+    ChangeSet, KeychainKind, LoadError, LoadMismatch, LoadWithPersistError, SpkMetadata, Wallet,
+    WalletPersister,
 };
 use bitcoin::constants::ChainHash;
 use bitcoin::hashes::Hash;
@@ -31,6 +32,43 @@ mod common;
 use common::*;
 
 const DB_MAGIC: &[u8] = &[0x21, 0x24, 0x48];
+
+#[test]
+fn sparse_spk_metadata_persists_before_sync() -> anyhow::Result<()> {
+    let mut conn = bdk_chain::rusqlite::Connection::open_in_memory()?;
+    let (descriptor, change_descriptor) = get_test_wpkh_and_change_desc();
+    let mut wallet = Wallet::create(descriptor, change_descriptor)
+        .network(Network::Regtest)
+        .create_wallet(&mut conn)?;
+    let metadata =
+        SpkMetadata::with_last_revealed(KeychainKind::External, Some(50_000), vec![0, 50_000])?;
+
+    wallet.apply_spk_metadata_sparse(&metadata)?;
+    wallet.persist(&mut conn)?;
+    drop(wallet);
+
+    let wallet = Wallet::load()
+        .load_wallet(&mut conn)?
+        .expect("wallet must reload");
+
+    assert_eq!(
+        wallet.derivation_index(KeychainKind::External),
+        Some(50_000)
+    );
+    assert_eq!(
+        wallet.spk_metadata(KeychainKind::External).used_indexes(),
+        &[0, 50_000]
+    );
+    assert_eq!(
+        wallet
+            .start_sync_with_spk_metadata_at(0)
+            .build()
+            .progress()
+            .total_spks(),
+        2
+    );
+    Ok(())
+}
 
 #[test]
 fn wallet_is_persisted() -> anyhow::Result<()> {

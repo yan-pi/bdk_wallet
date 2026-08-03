@@ -24,7 +24,7 @@ use core::{cmp::Ordering, fmt, mem, ops::Deref};
 
 use bdk_chain::{
     indexed_tx_graph,
-    indexer::keychain_txout::KeychainTxOutIndex,
+    indexer::keychain_txout::{KeychainTxOutIndex, RestoreKeychainError},
     local_chain::{ApplyHeaderError, CannotConnectError, CheckPoint, CheckPointIter, LocalChain},
     spk_client::{
         FullScanRequest, FullScanRequestBuilder, FullScanResponse, SyncRequest, SyncRequestBuilder,
@@ -1983,6 +1983,21 @@ impl Wallet {
         }
     }
 
+    /// Apply exact descriptor metadata without materializing gaps between known-used indexes.
+    pub fn apply_spk_metadata_sparse(
+        &mut self,
+        metadata: &SpkMetadata,
+    ) -> Result<(), RestoreKeychainError> {
+        let keychain = self.map_keychain(metadata.keychain());
+        let changeset = self.tx_graph.index.restore_keychain_state(
+            keychain,
+            metadata.last_revealed(),
+            metadata.used_indexes().iter().copied(),
+        )?;
+        self.stage.indexer.merge(changeset);
+        Ok(())
+    }
+
     /// The index of the next address that you would get if you were to ask the wallet for a new
     /// address.
     pub fn next_derivation_index(&self, keychain: KeychainKind) -> u32 {
@@ -2731,6 +2746,22 @@ impl Wallet {
 
 /// Methods to construct sync/full-scan requests for spk-based chain sources.
 impl Wallet {
+    /// Create a partial [`SyncRequest`] for SPKs known to be used by exact metadata snapshots.
+    pub fn start_sync_with_spk_metadata_at(
+        &self,
+        start_time: u64,
+    ) -> SyncRequestBuilder<(KeychainKind, u32)> {
+        use bdk_chain::keychain_txout::SyncRequestBuilderExt;
+        SyncRequest::builder_at(start_time)
+            .chain_tip(self.chain.tip())
+            .known_used_spks_from_indexer(&self.tx_graph.index, ..)
+            .expected_spk_txids(self.tx_graph.list_expected_spk_txids(
+                &self.chain,
+                self.chain.tip().block_id(),
+                ..,
+            ))
+    }
+
     /// Create a partial [`SyncRequest`] for all revealed spks at `start_time`.
     ///
     /// The `start_time` is used to record the time that a mempool transaction was last seen
@@ -3237,5 +3268,70 @@ mod test {
             wallet.list_unused_addresses(KeychainKind::External).count(),
             101
         );
+    }
+
+    #[test]
+    fn test_apply_spk_metadata_sparse_requests_only_known_used() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(100), vec![1, 20, 50])
+                .expect("metadata should be valid");
+        let (desc, change_desc) = get_test_wpkh_and_change_desc();
+        let mut wallet = Wallet::create(desc, change_desc)
+            .network(Network::Regtest)
+            .create_wallet_no_persist()
+            .expect("research descriptors should be valid");
+
+        wallet
+            .apply_spk_metadata_sparse(&metadata)
+            .expect("sparse metadata should apply");
+        let request = wallet.start_sync_with_spk_metadata_at(0).build();
+
+        assert_eq!(wallet.derivation_index(KeychainKind::External), Some(100));
+        assert_eq!(request.progress().total_spks(), 3);
+    }
+
+    #[test]
+    fn test_sparse_metadata_update_indexes_high_output() {
+        let metadata =
+            SpkMetadata::with_last_revealed(KeychainKind::External, Some(50_000), vec![50_000])
+                .expect("metadata should be valid");
+        let (desc, change_desc) = get_test_wpkh_and_change_desc();
+        let mut wallet = Wallet::create(desc, change_desc)
+            .network(Network::Regtest)
+            .create_wallet_no_persist()
+            .expect("research descriptors should be valid");
+        let high_spk = wallet
+            .peek_address(KeychainKind::External, 50_000)
+            .address
+            .script_pubkey();
+        wallet
+            .apply_spk_metadata_sparse(&metadata)
+            .expect("sparse metadata should apply");
+
+        let tx = Arc::new(Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: high_spk,
+            }],
+        });
+        let txid = tx.compute_txid();
+        let mut tx_update = TxUpdate::default();
+        tx_update.txs.push(tx);
+        tx_update.seen_ats.insert((txid, 1));
+
+        wallet
+            .apply_update(Update {
+                tx_update,
+                ..Default::default()
+            })
+            .expect("sparse update should apply");
+
+        assert!(wallet.get_tx(txid).is_some());
+        assert!(wallet
+            .list_unspent()
+            .any(|output| output.outpoint == OutPoint::new(txid, 0)));
     }
 }

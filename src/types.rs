@@ -291,6 +291,7 @@ impl SpkMetadata {
             index
                 .keychain_outpoints(keychain)
                 .map(|(index, _)| index)
+                .chain(index.known_used_keychain_indexes(keychain))
                 .collect::<Vec<_>>(),
         );
 
