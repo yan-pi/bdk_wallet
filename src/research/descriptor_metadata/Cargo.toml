@@ -6,5 +6,14 @@ publish = false
 
 [dependencies]
 bdk_wallet = { path = "../../..", features = ["std", "elias-fano", "test-utils"] }
-csv = "1"
-serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "restoration"
+harness = false
+
+[patch.crates-io]
+bdk_chain = { path = "../../../../bdk/crates/chain" }
+bdk_core = { path = "../../../../bdk/crates/core" }
