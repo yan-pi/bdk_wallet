@@ -6,12 +6,19 @@ publish = false
 
 [dependencies]
 bdk_wallet = { path = "../../..", features = ["std", "elias-fano", "test-utils"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series"] }
 
 [[bench]]
 name = "restoration"
+harness = false
+
+[[bench]]
+name = "density_sweep"
 harness = false
 
 [patch.crates-io]

@@ -1,5 +1,8 @@
 //! Deterministic harness for descriptor-metadata restoration research.
 
+pub mod density;
+pub mod density_plot;
+
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},

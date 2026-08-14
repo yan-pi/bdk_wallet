@@ -14,6 +14,10 @@ state restoration in the real `KeychainTxOutIndex`, including changeset persiste
 The architectural decision for Phase 2 is recorded in the companion `bdk` checkout:
 [ADR-0004: Decouple Logical Keychain Frontier from SPK Materialization](../../../../bdk/docs/adr/0004_sparse_keychain_restoration.md).
 
+The secondary exact-density sensitivity study is specified separately in
+[`DENSITY_SWEEP.md`](DENSITY_SWEEP.md). It does not change the canonical fixtures,
+benchmarks, or conclusions documented here.
+
 ## Research Question
 
 Given a descriptor and an exact `SpkMetadata` snapshot exported by the user, how much
