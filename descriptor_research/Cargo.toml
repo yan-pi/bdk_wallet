@@ -1,0 +1,31 @@
+[package]
+name = "descriptor_metadata_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+criterion = { version = "0.5.1", features = ["html_reports"] }
+
+bdk_wallet = {
+    path = "..",
+    features = ["rusqlite", "elias-fano", "test-utils"]
+}
+
+bdk_chain = {
+    path = "../../bdk/crates/chain",
+    default-features = false,
+    features = ["std", "miniscript", "serde", "rusqlite"]
+}
+
+serde_json = "1"
+tempfile = "3"
+
+[patch.crates-io]
+bdk_chain = { path = "../../bdk/crates/chain" }
+bdk_core = { path = "../../bdk/crates/core" }
+
+[[bench]]
+name = "descriptor_metadata"
+path = "benches/descriptor_metadata/main.rs"
+harness = false

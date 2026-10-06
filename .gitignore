@@ -13,3 +13,6 @@ examples/test_data
 
 # Coverage reports
 lcov.info
+
+# Standalone descriptor benchmark artifacts
+/descriptor_research/target/
