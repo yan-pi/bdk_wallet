@@ -11,9 +11,7 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(1))
         .sample_size(10);
-    targets =
-        restore::sparse_restore,
-        restore::dense_restore
+    targets = restore::benchmarks
 }
 
 criterion_main!(benches);

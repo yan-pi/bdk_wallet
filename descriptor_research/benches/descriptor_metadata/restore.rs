@@ -6,7 +6,10 @@ use bdk_chain::{
     miniscript::{Descriptor, DescriptorPublicKey},
 };
 use bdk_wallet::KeychainKind;
-use criterion::{measurement::WallTime, AxisScale, BatchSize, BenchmarkId, BenchmarkGroup, Criterion, PlotConfiguration};
+use criterion::{
+    measurement::WallTime, AxisScale, BatchSize, BenchmarkGroup, BenchmarkId, Criterion,
+    PlotConfiguration,
+};
 
 use crate::fixture::{descriptor, new_index, restore_cases, BenchCase};
 
@@ -40,79 +43,112 @@ fn do_dense_restore(mut index: Index, case: &BenchCase) -> DenseOutput {
     (index, revealed_spks, changeset)
 }
 
-fn validate_logical_state(index: &Index, case: &BenchCase){
-    assert_eq!(index.last_revealed_index(case.metadata.keychain()), case.metadata.last_revealed(),)
-
-    let know_used = index
-        .known_used_keychain_indexes(case.metadata.keychain()),
-        .collect::<Vec<_>>();
-
+fn validate_last_revealed(index: &Index, case: &BenchCase) {
     assert_eq!(
-        know_used.as_slice(),
-        case.metadata.used_indexes(),
+        index.last_revealed_index(case.metadata.keychain()),
+        case.metadata.last_revealed(),
     );
 }
 
-pub fn sparse_restore(c: &mut Criterion) {
-    let cases = [BenchCase::smoke(), BenchCase::pathological_high()];
+fn validate_sparse_state(index: &Index, case: &BenchCase) {
+    validate_last_revealed(index, case);
 
-    let mut group = c.benchmark_group("restore/sparse");
+    let known_used = index
+        .known_used_keychain_indexes(case.metadata.keychain())
+        .collect::<Vec<_>>();
 
-    for case in cases {
-        let descriptor = descriptor();
-
-        let validation_index = do_sparse_restore(new_index(&case, &descriptor), &case).0;
-
-        assert_eq!(
-            validation_index.inner().all_spks().len(),
-            case.expected_sparse_materialized(),
-        );
-
-        group.bench_with_input(
-            BenchmarkId::from_parameter(case.id()),
-            &case,
-            move |bencher, case| {
-                bencher.iter_batched(
-                    || new_index(case, &descriptor),
-                    |index| black_box(do_sparse_restore(index, case)),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
-    }
-
-    group.finish();
+    assert_eq!(known_used.as_slice(), case.metadata.used_indexes(),);
 }
 
-pub fn dense_restore(c: &mut Criterion) {
-    let cases = [BenchCase::smoke(), BenchCase::pathological_high()];
+fn validate_case(case: &BenchCase, descriptor: &Descriptor<DescriptorPublicKey>) {
+    assert!(
+        case.stop_gap > 0,
+        "fixture stop-gap must be greater than zero",
+    );
 
-    let mut group = c.benchmark_group("restore/dense");
+    let (sparse_index, _changeset) = do_sparse_restore(new_index(case, descriptor), case);
 
-    for case in cases {
-        let descriptor = descriptor();
+    validate_sparse_state(&sparse_index, case);
 
-        let (validation_index, revealed_spks, _changeset) =
-            do_dense_restore(new_index(&case, &descriptor), &case);
+    assert_eq!(
+        sparse_index.inner().all_spks().len(),
+        case.expected_sparse_materialized(),
+    );
 
-        assert_eq!(revealed_spks.len(), case.revealed_count(),);
+    let (dense_index, revealed_spks, _changeset) =
+        do_dense_restore(new_index(case, descriptor), case);
 
-        assert_eq!(
-            validation_index.inner().all_spks().len(),
-            case.expected_dense_materialized(),
+    validate_last_revealed(&dense_index, case);
+
+    assert_eq!(revealed_spks.len(), case.revealed_count(),);
+
+    assert_eq!(
+        dense_index.inner().all_spks().len(),
+        case.expected_dense_materialized(),
+    );
+
+    for &used_index in case.metadata.used_indexes() {
+        assert!(dense_index.is_used(case.metadata.keychain(), used_index,),);
+    }
+}
+
+fn benchmark_sparse(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    case: &BenchCase,
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) {
+    let benchmark_id = BenchmarkId::new("sparse", case.last_revealed());
+
+    let case = case.clone();
+    let descriptor = descriptor.clone();
+
+    group.bench_function(benchmark_id, move |bencher| {
+        bencher.iter_batched(
+            // Setup: excluded from the measurement.
+            || new_index(&case, &descriptor),
+            // Operation under measurement.
+            |index| black_box(do_sparse_restore(index, &case)),
+            BatchSize::SmallInput,
         );
+    });
+}
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(case.id()),
-            &case,
-            move |bencher, case| {
-                bencher.iter_batched(
-                    || new_index(case, &descriptor),
-                    |index| black_box(do_dense_restore(index, case)),
-                    BatchSize::LargeInput,
-                );
-            },
+fn benchmark_dense(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    case: &BenchCase,
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) {
+    let benchmark_id = BenchmarkId::new("dense", case.last_revealed());
+
+    let case = case.clone();
+    let descriptor = descriptor.clone();
+
+    group.bench_function(benchmark_id, move |bencher| {
+        bencher.iter_batched(
+            // Setup: excluded from the measurement.
+            || new_index(&case, &descriptor),
+            // Operation under measurement.
+            |index| black_box(do_dense_restore(index, &case)),
+            BatchSize::LargeInput,
         );
+    });
+}
+
+pub fn benchmarks(c: &mut Criterion) {
+    let descriptor = descriptor();
+
+    let plot_config = PlotConfiguration::default().summary_scale(AxisScale::Logarithmic);
+
+    let mut group = c.benchmark_group("restore/tail");
+    group.plot_config(plot_config);
+
+    for case in restore_cases() {
+        // Structural validation is performed once, outside Criterion timing.
+        validate_case(&case, &descriptor);
+
+        benchmark_sparse(&mut group, &case, &descriptor);
+
+        benchmark_dense(&mut group, &case, &descriptor);
     }
 
     group.finish();

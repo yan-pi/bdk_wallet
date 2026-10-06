@@ -9,18 +9,10 @@ use bdk_wallet::{KeychainKind, SpkMetadata};
 
 const BENCH_DESCRIPTOR: &str = "tr([ab28dc00/86h/1h/0h]tpubDCdDtzAMZZrkwKBxwNcGCqe4FRydeD9rfMisoi7qLdraG79YohRfPW4YgdKQhpgASdvh612xXNY5xYzoqnyCgPbkpK4LSVcH5Xv4cK7johH/0/*)";
 
-const RESTORE_REVEALED_COUNT: [u32; 6] = [
-    100,
-    500,
-    1_000,
-    5_000,
-    10_000,
-    50_000,
-]
+const RESTORE_LAST_REVEALED_VALUES: [u32; 6] = [100, 500, 1_000, 5_000, 10_000, 50_000];
 
 const REVEAL_LOOKAHEAD: u32 = 20;
 const RESTORE_STOP_GAP: u32 = 10;
-
 
 #[derive(Clone, Debug)]
 pub struct BenchCase {
@@ -32,12 +24,7 @@ pub struct BenchCase {
 }
 
 impl BenchCase {
-    pub fn new(
-        last_revealed: u32,
-        used_indexes: Vec<u32>,
-        lookahead: u32,
-        stop_gap: u32,
-    ) -> Self {
+    pub fn new(last_revealed: u32, used_indexes: Vec<u32>, lookahead: u32, stop_gap: u32) -> Self {
         let metadata = SpkMetadata::with_last_revealed(
             KeychainKind::External,
             Some(last_revealed),
@@ -46,7 +33,6 @@ impl BenchCase {
         .expect("benchmark metadata must be valid");
 
         Self {
-            name,
             metadata,
             lookahead,
             stop_gap,
@@ -72,11 +58,6 @@ impl BenchCase {
         self.last_revealed() as usize + 1
     }
 
-
-    pub fn used_count(&self) -> usize {
-        self.metadata.used_indexes().len()
-    }
-
     pub fn expected_sparse_materialized(&self) -> usize {
         let mut materialized_indexes = BTreeSet::new();
 
@@ -96,7 +77,7 @@ impl BenchCase {
     }
 }
 
-pub restore_cases() -> Vec<BenchCase> {
+pub fn restore_cases() -> Vec<BenchCase> {
     RESTORE_LAST_REVEALED_VALUES
         .into_iter()
         .map(BenchCase::tail)
@@ -104,20 +85,20 @@ pub restore_cases() -> Vec<BenchCase> {
 }
 
 pub fn descriptor() -> Descriptor<DescriptorPublicKey> {
-    Descriptor::<DescriptorPublicKey>::parse_descriptor(&Secp256k1::new(), BENCH_DESCRIPTOR)
+    BENCH_DESCRIPTOR
+        .parse()
         .expect("benchmark descriptor must parse")
-        .0
 }
 
 pub fn new_index(
     case: &BenchCase,
     descriptor: &Descriptor<DescriptorPublicKey>,
-) -> KeychainTxOutIndex<KeychainKind> {
-    let mut index = KeychainTxOutIndex::new(case.lookahead, false);
-
-    index
-        .insert_descriptor(case.metadata.keychain(), descriptor.clone())
-        .expect("benchmark new index must insert descriptor");
-
+) -> KeychainTxOutIndex<bdk_wallet::KeychainKind> {
+    let mut index = KeychainTxOutIndex::new();
+    index.set_lookahead(case.lookahead);
+    index.add_keychain(bdk_wallet::KeychainKind::External, descriptor.clone());
     index
 }
+
+#[allow(dead_code)]
+fn _assert_secp_type(_: Secp256k1<bdk_chain::bitcoin::secp256k1::All>) {}
