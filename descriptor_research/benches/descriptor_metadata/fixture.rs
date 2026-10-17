@@ -85,20 +85,18 @@ pub fn restore_cases() -> Vec<BenchCase> {
 }
 
 pub fn descriptor() -> Descriptor<DescriptorPublicKey> {
-    BENCH_DESCRIPTOR
-        .parse()
+    Descriptor::<DescriptorPublicKey>::parse_descriptor(&Secp256k1::new(), BENCH_DESCRIPTOR)
         .expect("benchmark descriptor must parse")
+        .0
 }
 
 pub fn new_index(
     case: &BenchCase,
     descriptor: &Descriptor<DescriptorPublicKey>,
-) -> KeychainTxOutIndex<bdk_wallet::KeychainKind> {
-    let mut index = KeychainTxOutIndex::new();
-    index.set_lookahead(case.lookahead);
-    index.add_keychain(bdk_wallet::KeychainKind::External, descriptor.clone());
+) -> KeychainTxOutIndex<KeychainKind> {
+    let mut index = KeychainTxOutIndex::new(case.lookahead, false);
+    index
+        .insert_descriptor(case.metadata.keychain(), descriptor.clone())
+        .expect("benchmark descriptor must insert");
     index
 }
-
-#[allow(dead_code)]
-fn _assert_secp_type(_: Secp256k1<bdk_chain::bitcoin::secp256k1::All>) {}
